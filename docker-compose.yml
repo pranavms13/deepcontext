@@ -1,4 +1,24 @@
 services:
+  deepcontext:
+    build: .
+    container_name: deepcontext-api
+    ports:
+      - "8000:8000"
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - DEFAULT_COLLECTION=deepcontext_chunks
+      # Confluence (optional)
+      - CONFLUENCE_EMAIL=${CONFLUENCE_EMAIL:-}
+      - CONFLUENCE_TOKEN=${CONFLUENCE_TOKEN:-}
+      # GitHub (optional, for higher rate limits)
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+    volumes:
+      - deepcontext_data:/app/data
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
   qdrant:
     image: qdrant/qdrant:latest
     container_name: deepcontext-qdrant
@@ -9,7 +29,8 @@ services:
       - qdrant_data:/qdrant/storage
     environment:
       - QDRANT__SERVICE__GRPC_PORT=6334
+    restart: unless-stopped
 
 volumes:
   qdrant_data:
-
+  deepcontext_data:

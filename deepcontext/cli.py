@@ -9,7 +9,8 @@ from rich.table import Table
 
 from deepcontext.chunker import ChunkConfig, MarkdownCodeChunker, SemanticChunker
 from deepcontext.fetcher import ContentFetcher
-from deepcontext.models import SourceType
+from deepcontext.models import IngestJob, JobStatus, JobType, SourceType
+from deepcontext.queue import generate_job_id, JobQueue, JobWorker
 from deepcontext.store import VectorStore
 
 # Load environment variables from .env file
@@ -723,6 +724,495 @@ def clear(host: str, port: int, collection: str) -> None:
         raise click.Abort()
     finally:
         store.close()
+
+
+# ============================================================================
+# Queue Commands
+# ============================================================================
+
+
+@main.command()
+@click.argument("source")
+@click.option(
+    "--host",
+    default="localhost",
+    help="Qdrant host",
+)
+@click.option(
+    "--port",
+    default=6333,
+    type=int,
+    help="Qdrant port",
+)
+@click.option(
+    "--collection",
+    default="deepcontext_chunks",
+    help="Collection name",
+)
+@click.option(
+    "--chunk-size",
+    default=1024,
+    type=int,
+    help="Maximum chunk size in tokens",
+)
+@click.option(
+    "--threshold",
+    default=0.7,
+    type=float,
+    help="Similarity threshold for semantic chunking (0-1)",
+)
+@click.option(
+    "--code-aware/--no-code-aware",
+    default=True,
+    help="Use code-aware chunking for documentation",
+)
+def queue(
+    source: str,
+    host: str,
+    port: int,
+    collection: str,
+    chunk_size: int,
+    threshold: float,
+    code_aware: bool,
+) -> None:
+    """
+    Queue a source for ingestion (processed by background worker).
+
+    SOURCE can be:
+
+    \b
+    - A local file path (e.g., ./docs/README.md)
+    - A GitHub URL (e.g., https://github.com/vercel/next.js/blob/canary/docs/...)
+    - A Confluence page (e.g., https://company.atlassian.net/wiki/spaces/DOCS/pages/123456)
+    - A webpage URL (e.g., https://example.com/docs)
+
+    Use 'deepcontext worker' to process queued jobs.
+    """
+    job = IngestJob(
+        id=generate_job_id(),
+        job_type=JobType.SINGLE,
+        source=source,
+        collection=collection,
+        host=host,
+        port=port,
+        chunk_size=chunk_size,
+        threshold=threshold,
+        code_aware=code_aware,
+    )
+
+    job_queue = JobQueue()
+    job_queue.submit(job)
+
+    console.print(f"[green]✓[/green] Job queued: [cyan]{job.id}[/cyan]")
+    console.print(f"  Source: {source}")
+    console.print(f"  Collection: {collection}")
+    console.print()
+    console.print("[dim]Run 'deepcontext worker' to process the queue[/dim]")
+
+
+@main.command()
+@click.argument("repo")
+@click.option(
+    "--branch",
+    default=None,
+    help="Branch to fetch from (default: auto-detect)",
+)
+@click.option(
+    "--path",
+    default="",
+    help="Path within the repo to start from",
+)
+@click.option(
+    "--extensions",
+    default=".md,.mdx",
+    help="Comma-separated list of file extensions to fetch",
+)
+@click.option(
+    "--host",
+    default="localhost",
+    help="Qdrant host",
+)
+@click.option(
+    "--port",
+    default=6333,
+    type=int,
+    help="Qdrant port",
+)
+@click.option(
+    "--collection",
+    default="deepcontext_chunks",
+    help="Collection name",
+)
+def queue_repo(
+    repo: str,
+    branch: str | None,
+    path: str,
+    extensions: str,
+    host: str,
+    port: int,
+    collection: str,
+) -> None:
+    """
+    Queue a GitHub repository for ingestion.
+
+    REPO should be in format "owner/repo" (e.g., vercel/next.js)
+    """
+    job = IngestJob(
+        id=generate_job_id(),
+        job_type=JobType.REPO,
+        source=repo,
+        collection=collection,
+        host=host,
+        port=port,
+        branch=branch,
+        path=path,
+        extensions=extensions,
+    )
+
+    job_queue = JobQueue()
+    job_queue.submit(job)
+
+    console.print(f"[green]✓[/green] Job queued: [cyan]{job.id}[/cyan]")
+    console.print(f"  Repository: {repo}")
+    console.print(f"  Branch: {branch or 'auto-detect'}")
+    console.print(f"  Collection: {collection}")
+    console.print()
+    console.print("[dim]Run 'deepcontext worker' to process the queue[/dim]")
+
+
+@main.command()
+@click.argument("base_url")
+@click.argument("space_key")
+@click.option(
+    "--limit",
+    default=100,
+    type=int,
+    help="Maximum number of pages to fetch",
+)
+@click.option(
+    "--host",
+    default="localhost",
+    help="Qdrant host",
+)
+@click.option(
+    "--port",
+    default=6333,
+    type=int,
+    help="Qdrant port",
+)
+@click.option(
+    "--collection",
+    default="deepcontext_chunks",
+    help="Collection name",
+)
+def queue_confluence(
+    base_url: str,
+    space_key: str,
+    limit: int,
+    host: str,
+    port: int,
+    collection: str,
+) -> None:
+    """
+    Queue a Confluence space for ingestion.
+
+    \b
+    BASE_URL: Your Confluence base URL (e.g., https://company.atlassian.net/wiki)
+    SPACE_KEY: The space key (e.g., DOCS, ENG, TEAM)
+    """
+    job = IngestJob(
+        id=generate_job_id(),
+        job_type=JobType.CONFLUENCE_SPACE,
+        source=base_url,
+        collection=collection,
+        host=host,
+        port=port,
+        space_key=space_key,
+        limit=limit,
+    )
+
+    job_queue = JobQueue()
+    job_queue.submit(job)
+
+    console.print(f"[green]✓[/green] Job queued: [cyan]{job.id}[/cyan]")
+    console.print(f"  Space: {space_key}")
+    console.print(f"  Base URL: {base_url}")
+    console.print(f"  Collection: {collection}")
+    console.print()
+    console.print("[dim]Run 'deepcontext worker' to process the queue[/dim]")
+
+
+@main.command()
+@click.argument("url")
+@click.option(
+    "--max-pages",
+    default=100,
+    type=int,
+    help="Maximum number of pages to fetch",
+)
+@click.option(
+    "--pattern",
+    default=None,
+    help="URL pattern to filter pages (regex)",
+)
+@click.option(
+    "--no-sitemap",
+    is_flag=True,
+    help="Don't try to use sitemap.xml, crawl links instead",
+)
+@click.option(
+    "--host",
+    default="localhost",
+    help="Qdrant host",
+)
+@click.option(
+    "--port",
+    default=6333,
+    type=int,
+    help="Qdrant port",
+)
+@click.option(
+    "--collection",
+    default="deepcontext_chunks",
+    help="Collection name",
+)
+def queue_website(
+    url: str,
+    max_pages: int,
+    pattern: str | None,
+    no_sitemap: bool,
+    host: str,
+    port: int,
+    collection: str,
+) -> None:
+    """
+    Queue a website for ingestion.
+
+    URL: The base URL to start from (e.g., https://ui.shadcn.com/docs)
+    """
+    job = IngestJob(
+        id=generate_job_id(),
+        job_type=JobType.WEBSITE,
+        source=url,
+        collection=collection,
+        host=host,
+        port=port,
+        max_pages=max_pages,
+        url_pattern=pattern,
+        use_sitemap=not no_sitemap,
+    )
+
+    job_queue = JobQueue()
+    job_queue.submit(job)
+
+    console.print(f"[green]✓[/green] Job queued: [cyan]{job.id}[/cyan]")
+    console.print(f"  URL: {url}")
+    console.print(f"  Max pages: {max_pages}")
+    console.print(f"  Collection: {collection}")
+    console.print()
+    console.print("[dim]Run 'deepcontext worker' to process the queue[/dim]")
+
+
+@main.command()
+@click.option(
+    "--status",
+    type=click.Choice(["pending", "processing", "completed", "failed"]),
+    default=None,
+    help="Filter by job status",
+)
+@click.option(
+    "--limit",
+    default=20,
+    type=int,
+    help="Maximum number of jobs to show",
+)
+def jobs(status: str | None, limit: int) -> None:
+    """List jobs in the queue."""
+    job_queue = JobQueue()
+    status_filter = JobStatus(status) if status else None
+    job_list = job_queue.list_jobs(status=status_filter, limit=limit)
+
+    if not job_list:
+        console.print("[dim]No jobs found.[/dim]")
+        return
+
+    table = Table(title="Ingestion Jobs")
+    table.add_column("ID", style="cyan")
+    table.add_column("Type", style="dim")
+    table.add_column("Source", max_width=40)
+    table.add_column("Status")
+    table.add_column("Docs")
+    table.add_column("Chunks")
+    table.add_column("Created")
+
+    status_colors = {
+        JobStatus.PENDING: "yellow",
+        JobStatus.PROCESSING: "blue",
+        JobStatus.COMPLETED: "green",
+        JobStatus.FAILED: "red",
+    }
+
+    for job in job_list:
+        status_color = status_colors.get(job.status, "white")
+        source_display = job.source[:37] + "..." if len(job.source) > 40 else job.source
+        created = job.created_at.strftime("%Y-%m-%d %H:%M")
+
+        table.add_row(
+            job.id,
+            job.job_type.value,
+            source_display,
+            f"[{status_color}]{job.status.value}[/{status_color}]",
+            str(job.documents_count),
+            str(job.chunks_count),
+            created,
+        )
+
+    console.print(table)
+
+
+@main.command()
+@click.argument("job_id")
+def job(job_id: str) -> None:
+    """Show details for a specific job."""
+    job_queue = JobQueue()
+    job_info = job_queue.get_job(job_id)
+
+    if not job_info:
+        console.print(f"[red]Job not found: {job_id}[/red]")
+        raise click.Abort()
+
+    status_colors = {
+        JobStatus.PENDING: "yellow",
+        JobStatus.PROCESSING: "blue",
+        JobStatus.COMPLETED: "green",
+        JobStatus.FAILED: "red",
+    }
+    status_color = status_colors.get(job_info.status, "white")
+
+    console.print()
+    console.print(f"[bold]Job ID:[/bold] [cyan]{job_info.id}[/cyan]")
+    console.print(f"[bold]Status:[/bold] [{status_color}]{job_info.status.value}[/{status_color}]")
+    console.print(f"[bold]Type:[/bold] {job_info.job_type.value}")
+    console.print(f"[bold]Source:[/bold] {job_info.source}")
+    console.print()
+    console.print(f"[bold]Collection:[/bold] {job_info.collection}")
+    console.print(f"[bold]Host:[/bold] {job_info.host}:{job_info.port}")
+    console.print()
+    console.print(f"[bold]Created:[/bold] {job_info.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    if job_info.started_at:
+        console.print(f"[bold]Started:[/bold] {job_info.started_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    if job_info.completed_at:
+        console.print(f"[bold]Completed:[/bold] {job_info.completed_at.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    if job_info.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+        console.print()
+        console.print(f"[bold]Documents:[/bold] {job_info.documents_count}")
+        console.print(f"[bold]Chunks:[/bold] {job_info.chunks_count}")
+
+    if job_info.error_message:
+        console.print()
+        console.print(f"[bold red]Error:[/bold red] {job_info.error_message}")
+
+
+@main.command()
+@click.option(
+    "--once",
+    is_flag=True,
+    help="Process one job and exit",
+)
+@click.option(
+    "--poll-interval",
+    default=2.0,
+    type=float,
+    help="Seconds between polling for new jobs",
+)
+def worker(once: bool, poll_interval: float) -> None:
+    """Run the background worker to process queued jobs."""
+
+    def log_message(msg: str) -> None:
+        console.print(f"[dim]{msg}[/dim]")
+
+    job_worker = JobWorker(log_callback=log_message)
+
+    if once:
+        if job_worker.run_once():
+            console.print("[green]✓ Job processed[/green]")
+        else:
+            console.print("[dim]No pending jobs[/dim]")
+    else:
+        console.print("[bold]Starting DeepContext Worker[/bold]")
+        console.print(f"[dim]Poll interval: {poll_interval}s[/dim]")
+        console.print("[dim]Press Ctrl+C to stop[/dim]")
+        console.print()
+        try:
+            job_worker.run(poll_interval=poll_interval)
+        except KeyboardInterrupt:
+            console.print()
+            console.print("[yellow]Worker stopped[/yellow]")
+
+
+@main.command()
+@click.argument("job_id")
+def cancel_job(job_id: str) -> None:
+    """Cancel/delete a job from the queue."""
+    job_queue = JobQueue()
+    job_info = job_queue.get_job(job_id)
+
+    if not job_info:
+        console.print(f"[red]Job not found: {job_id}[/red]")
+        raise click.Abort()
+
+    if job_info.status == JobStatus.PROCESSING:
+        console.print("[yellow]Warning: Job is currently processing. It will be removed from the queue but may still complete.[/yellow]")
+
+    if job_queue.delete_job(job_id):
+        console.print(f"[green]✓ Job deleted: {job_id}[/green]")
+    else:
+        console.print(f"[red]Failed to delete job: {job_id}[/red]")
+
+
+@main.command()
+@click.confirmation_option(prompt="Clear all completed and failed jobs?")
+def clear_jobs() -> None:
+    """Clear completed and failed jobs from the queue."""
+    job_queue = JobQueue()
+    count = job_queue.clear_completed()
+    console.print(f"[green]✓ Cleared {count} jobs[/green]")
+
+
+@main.command()
+@click.option(
+    "--host",
+    default="0.0.0.0",
+    help="Host to bind to",
+)
+@click.option(
+    "--port",
+    default=8000,
+    type=int,
+    help="Port to bind to",
+)
+@click.option(
+    "--reload",
+    is_flag=True,
+    help="Enable auto-reload for development",
+)
+def serve(host: str, port: int, reload: bool) -> None:
+    """Start the DeepContext API server."""
+    import uvicorn
+
+    console.print(f"[bold]Starting DeepContext API Server[/bold]")
+    console.print(f"[dim]Host: {host}:{port}[/dim]")
+    console.print(f"[dim]Docs: http://{host if host != '0.0.0.0' else 'localhost'}:{port}/docs[/dim]")
+    console.print()
+
+    uvicorn.run(
+        "deepcontext.api:app",
+        host=host,
+        port=port,
+        reload=reload,
+    )
 
 
 if __name__ == "__main__":
