@@ -1,6 +1,8 @@
 """Vector store using Qdrant for semantic search."""
 
 import hashlib
+import re
+from datetime import datetime
 from typing import Generator
 
 from fastembed import TextEmbedding
@@ -14,7 +16,199 @@ from qdrant_client.models import (
     VectorParams,
 )
 
-from deepcontext.models import Chunk, SearchResult, SourceType
+from deepcontext.models import Chunk, Library, SearchResult, SourceType
+
+
+def library_id_to_collection_name(library_id: str) -> str:
+    """
+    Convert a library ID to a valid Qdrant collection name.
+    
+    Examples:
+        /vercel/next.js -> vercel__next_js
+        /shadcn-ui/ui -> shadcn-ui__ui
+        /org/project/v1.0.0 -> org__project__v1_0_0
+    """
+    # Remove leading slash
+    clean_id = library_id.lstrip("/")
+    # Replace / with __
+    clean_id = clean_id.replace("/", "__")
+    # Replace . with _
+    clean_id = clean_id.replace(".", "_")
+    # Replace any other invalid chars with _
+    clean_id = re.sub(r"[^a-zA-Z0-9_-]", "_", clean_id)
+    return clean_id
+
+
+def derive_library_id(source: str, job_type: str) -> str:
+    """
+    Derive a library ID from the source and job type.
+    
+    Returns format like /org/project or /domain/path
+    """
+    if job_type == "repo":
+        # GitHub repo: owner/repo -> /owner/repo
+        # Remove any github.com prefix if present
+        source = source.replace("https://github.com/", "").replace("http://github.com/", "")
+        source = source.rstrip("/")
+        if not source.startswith("/"):
+            source = "/" + source
+        return source
+    elif job_type == "website":
+        # Website: extract domain
+        from urllib.parse import urlparse
+        parsed = urlparse(source)
+        domain = parsed.netloc.replace("www.", "")
+        return f"/{domain}"
+    elif job_type == "confluence_space":
+        # Confluence: /confluence/space_key
+        from urllib.parse import urlparse
+        parsed = urlparse(source)
+        domain = parsed.netloc.replace("www.", "")
+        return f"/{domain}"
+    else:
+        # Single source - try to extract meaningful ID
+        if "github.com" in source:
+            source = source.replace("https://github.com/", "").replace("http://github.com/", "")
+            parts = source.split("/")[:2]
+            return "/" + "/".join(parts)
+        return "/" + hashlib.md5(source.encode()).hexdigest()[:12]
+
+
+class LibraryStore:
+    """Store for managing library metadata in Qdrant."""
+    
+    COLLECTION_NAME = "libraries"
+    
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 6333,
+    ):
+        self.host = host
+        self.port = port
+        self._client: QdrantClient | None = None
+    
+    @property
+    def client(self) -> QdrantClient:
+        """Lazy-load Qdrant client."""
+        if self._client is None:
+            self._client = QdrantClient(host=self.host, port=self.port)
+        return self._client
+    
+    def ensure_collection(self) -> None:
+        """Ensure the libraries collection exists."""
+        collections = self.client.get_collections().collections
+        collection_names = [c.name for c in collections]
+        
+        if self.COLLECTION_NAME not in collection_names:
+            # Libraries collection uses a simple 1-dimensional vector (placeholder)
+            # We're not doing semantic search on libraries, just storing metadata
+            self.client.create_collection(
+                collection_name=self.COLLECTION_NAME,
+                vectors_config=VectorParams(
+                    size=1,  # Minimal vector, we only care about payload
+                    distance=Distance.COSINE,
+                ),
+            )
+    
+    def upsert_library(self, library: Library) -> None:
+        """Insert or update a library record."""
+        self.ensure_collection()
+        
+        point = PointStruct(
+            id=self._library_id_to_int(library.library_id),
+            vector=[0.0],  # Placeholder vector
+            payload={
+                "library_id": library.library_id,
+                "name": library.name,
+                "collection_name": library.collection_name,
+                "source": library.source,
+                "source_type": library.source_type,
+                "updated_at": library.updated_at.isoformat(),
+                "created_at": library.created_at.isoformat(),
+                "documents_count": library.documents_count,
+                "chunks_count": library.chunks_count,
+                "metadata": library.metadata,
+            },
+        )
+        
+        self.client.upsert(
+            collection_name=self.COLLECTION_NAME,
+            points=[point],
+        )
+    
+    def get_library(self, library_id: str) -> Library | None:
+        """Get a library by its ID."""
+        try:
+            results = self.client.retrieve(
+                collection_name=self.COLLECTION_NAME,
+                ids=[self._library_id_to_int(library_id)],
+            )
+            if results:
+                payload = results[0].payload or {}
+                return Library(
+                    library_id=payload.get("library_id", ""),
+                    name=payload.get("name", ""),
+                    collection_name=payload.get("collection_name", ""),
+                    source=payload.get("source", ""),
+                    source_type=payload.get("source_type", ""),
+                    updated_at=datetime.fromisoformat(payload["updated_at"]) if payload.get("updated_at") else datetime.now(),
+                    created_at=datetime.fromisoformat(payload["created_at"]) if payload.get("created_at") else datetime.now(),
+                    documents_count=payload.get("documents_count", 0),
+                    chunks_count=payload.get("chunks_count", 0),
+                    metadata=payload.get("metadata", {}),
+                )
+        except Exception:
+            pass
+        return None
+    
+    def list_libraries(self, limit: int = 100) -> list[Library]:
+        """List all libraries."""
+        try:
+            self.ensure_collection()
+            results = self.client.scroll(
+                collection_name=self.COLLECTION_NAME,
+                limit=limit,
+            )
+            libraries = []
+            for point in results[0]:
+                payload = point.payload or {}
+                libraries.append(Library(
+                    library_id=payload.get("library_id", ""),
+                    name=payload.get("name", ""),
+                    collection_name=payload.get("collection_name", ""),
+                    source=payload.get("source", ""),
+                    source_type=payload.get("source_type", ""),
+                    updated_at=datetime.fromisoformat(payload["updated_at"]) if payload.get("updated_at") else datetime.now(),
+                    created_at=datetime.fromisoformat(payload["created_at"]) if payload.get("created_at") else datetime.now(),
+                    documents_count=payload.get("documents_count", 0),
+                    chunks_count=payload.get("chunks_count", 0),
+                    metadata=payload.get("metadata", {}),
+                ))
+            return libraries
+        except Exception:
+            return []
+    
+    def delete_library(self, library_id: str) -> bool:
+        """Delete a library record."""
+        try:
+            self.client.delete(
+                collection_name=self.COLLECTION_NAME,
+                points_selector=[self._library_id_to_int(library_id)],
+            )
+            return True
+        except Exception:
+            return False
+    
+    def _library_id_to_int(self, library_id: str) -> int:
+        """Convert a library ID string to an integer for Qdrant."""
+        return int(hashlib.sha256(library_id.encode()).hexdigest()[:16], 16)
+    
+    def close(self) -> None:
+        """Close the client connection."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
 
 class VectorStore:
