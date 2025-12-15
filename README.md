@@ -331,10 +331,11 @@ Options:
 
                  ┌──────────────────────────────────────────────────────────┐
                  │                   DeepContext Service                    │
-                 │  - HTTP API (/ingest, /search, /libraries, /stats, …)   │
-                 │  - Background worker processing queued jobs             │
-                 │  - MCP server (streamable-http) mounted at `/mcp`       │
+                 │   - HTTP API (/ingest, /search, /libraries, /stats, …)   │
+                 │   - Background worker processing queued jobs             │
+                 │   - MCP server (streamable-http) mounted at `/mcp`       │
                  └──────────────────────────────────────────────────────────┘
+```
 
 ## Python API
 
