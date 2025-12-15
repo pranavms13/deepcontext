@@ -4,6 +4,8 @@ import hashlib
 import re
 from dataclasses import dataclass
 
+from chonkie import SemanticChunker as ChonkieSemanticChunker
+
 from deepcontext.models import Chunk, Document
 
 
@@ -11,9 +13,11 @@ from deepcontext.models import Chunk, Document
 class ChunkConfig:
     """Configuration for chunking."""
 
-    max_chunk_size: int = 2000  # Max characters per chunk
+    max_chunk_size: int = 2000  # Max characters/tokens per chunk
     min_chunk_size: int = 200   # Min characters for a chunk to be meaningful
     overlap_size: int = 100     # Overlap between chunks for context
+    threshold: float = 0.7      # Similarity threshold for semantic chunking (0-1)
+    embedding_model: str = "BAAI/bge-base-en-v1.5"  # Model for semantic embeddings (768 dims)
 
 
 class DocumentChunker:
@@ -349,7 +353,159 @@ class DocumentChunker:
         return "Documentation section."
 
 
-# Keep backwards compatibility aliases
-SemanticChunker = DocumentChunker
+class SemanticChunker:
+    """
+    Semantic chunker that uses chonkie's embedding-based chunking.
+    
+    Groups semantically similar text together using embeddings,
+    which is more intelligent than simple paragraph/heading splitting.
+    """
+
+    def __init__(self, config: ChunkConfig | None = None):
+        self.config = config or ChunkConfig()
+        self._chunker = ChonkieSemanticChunker(
+            embedding_model=self.config.embedding_model,
+            threshold=self.config.threshold,
+            chunk_size=self.config.max_chunk_size,
+            min_sentences_per_chunk=1,
+        )
+
+    def chunk_document(self, document: Document) -> list[Chunk]:
+        """
+        Chunk a document using semantic similarity.
+        """
+        content = document.content
+        doc_title = self._clean_doc_title(document.title)
+        
+        # Use chonkie's semantic chunker
+        chonkie_chunks = self._chunker.chunk(content)
+        
+        chunks: list[Chunk] = []
+        for i, chonkie_chunk in enumerate(chonkie_chunks):
+            chunk_text = chonkie_chunk.text.strip()
+            
+            # Skip very small chunks
+            if len(chunk_text) < self.config.min_chunk_size:
+                continue
+            
+            # Extract code blocks from this chunk
+            code_blocks = self._extract_code_blocks(chunk_text)
+            
+            # Generate title from first heading or first line
+            title = self._generate_title(chunk_text, doc_title, i)
+            
+            # Generate description
+            description = self._generate_description(chunk_text, code_blocks)
+            
+            # Determine language from code blocks
+            languages = [cb["language"] for cb in code_blocks if cb["language"]]
+            language = languages[0] if languages else None
+            
+            # Generate ID
+            chunk_id = hashlib.sha256(
+                f"{document.id}:semantic:{i}:{chunk_text[:100]}".encode()
+            ).hexdigest()[:16]
+            
+            chunks.append(Chunk(
+                id=chunk_id,
+                document_id=document.id,
+                source=document.source,
+                source_type=document.source_type,
+                title=title,
+                description=description,
+                content=chunk_text,
+                code_blocks=[cb["code"] for cb in code_blocks if cb["code"]],
+                language=language,
+                token_count=chonkie_chunk.token_count,
+                metadata={
+                    **document.metadata,
+                    "document_title": doc_title,
+                    "chunk_index": i,
+                },
+            ))
+        
+        return chunks
+
+    def _clean_doc_title(self, title: str | None) -> str:
+        """Clean up document title."""
+        if not title:
+            return "Document"
+        title = re.sub(r'\s*[-|–—]\s*(shadcn/ui|Docs|Documentation).*$', '', title, flags=re.I)
+        return title.strip()
+
+    def _extract_code_blocks(self, content: str) -> list[dict]:
+        """Extract code blocks from content."""
+        code_blocks = []
+        pattern = r'```(\w*)\n(.*?)```'
+        for match in re.finditer(pattern, content, re.DOTALL):
+            code_blocks.append({
+                "language": match.group(1) or None,
+                "code": match.group(2).strip(),
+            })
+        return code_blocks
+
+    def _generate_title(self, content: str, doc_title: str, chunk_index: int) -> str:
+        """Generate a title for the chunk."""
+        # Try to find a heading in the content
+        heading_match = re.search(r'^#{1,6}\s+(.+)$', content, re.MULTILINE)
+        if heading_match:
+            section_title = heading_match.group(1).strip()
+            if doc_title and doc_title.lower() != section_title.lower():
+                if doc_title.lower() not in section_title.lower():
+                    return f"{doc_title} - {section_title}"
+            return section_title
+        
+        # Fall back to first meaningful line
+        lines = content.split('\n')
+        for line in lines:
+            line = line.strip()
+            if len(line) > 10 and not line.startswith('```'):
+                # Clean markdown formatting
+                title = re.sub(r'[*_`#]', '', line)[:60]
+                if doc_title:
+                    return f"{doc_title} - {title}"
+                return title
+        
+        return f"{doc_title} (Part {chunk_index + 1})"
+
+    def _generate_description(self, content: str, code_blocks: list[dict]) -> str:
+        """Generate a meaningful description for the chunk."""
+        # Remove code blocks for text analysis
+        text = re.sub(r'```.*?```', '', content, flags=re.DOTALL)
+        
+        # Remove markdown formatting
+        text = re.sub(r'#{1,6}\s+', '', text)
+        text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+        text = re.sub(r'\*([^*]+)\*', r'\1', text)
+        text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+        text = re.sub(r'`([^`]+)`', r'\1', text)
+        
+        # Get meaningful sentences
+        sentences = re.split(r'[.!?]\s+', text)
+        meaningful = [
+            s.strip() for s in sentences 
+            if len(s.strip()) > 20 
+            and not s.strip().startswith('Copy')
+            and not re.match(r'^[\*\-\|]', s.strip())
+        ]
+        
+        if meaningful:
+            desc = '. '.join(meaningful[:3])
+            desc = re.sub(r'\s+', ' ', desc).strip()
+            if not desc.endswith('.'):
+                desc += '.'
+            if len(desc) > 500:
+                desc = desc[:497] + '...'
+            return desc
+        
+        if code_blocks:
+            languages = list(set(cb["language"] for cb in code_blocks if cb["language"]))
+            if languages:
+                return f"Code example in {', '.join(languages)}."
+            return f"Contains {len(code_blocks)} code example(s)."
+        
+        return "Documentation section."
+
+
+# Keep backwards compatibility - MarkdownCodeChunker uses the heading-aware DocumentChunker
 MarkdownCodeChunker = DocumentChunker
-ChunkConfig = ChunkConfig

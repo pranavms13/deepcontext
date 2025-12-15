@@ -219,7 +219,7 @@ class VectorStore:
         host: str = "localhost",
         port: int = 6333,
         collection_name: str = "deepcontext_chunks",
-        embedding_model: str = "BAAI/bge-small-en-v1.5",
+        embedding_model: str = "BAAI/bge-base-en-v1.5",
     ):
         self.host = host
         self.port = port

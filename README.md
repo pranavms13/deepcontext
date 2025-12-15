@@ -8,8 +8,11 @@ A semantic chunking service for documents, GitHub repos, webpages, and Confluenc
 - **Website crawling**: Ingest entire documentation sites via sitemap or link crawling
 - **Semantic chunking**: Intelligent text chunking with code-awareness
 - **Code-aware**: Extracts code blocks with context and language detection
+- **Per-library indexing**: Each library/site gets its own Qdrant collection plus a central `libraries` index
 - **Vector search**: Powered by Qdrant for fast semantic search
-- **Fast embeddings**: Uses FastEmbed (BAAI/bge-small-en-v1.5) for efficient embedding generation
+- **Fast embeddings**: Uses FastEmbed / BAAI bge models for efficient embedding generation
+- **HTTP API + background worker**: Queue-based ingestion API with an async worker that processes jobs in the background
+- **MCP server**: First-class Model Context Protocol (MCP) server exposing DeepContext as a documentation tool
 
 ## Quick Start
 
@@ -29,7 +32,7 @@ podman compose up -d
 uv sync
 ```
 
-### 3. Ingest content
+### 3. Ingest content (CLI)
 
 ```bash
 # From a local markdown file
@@ -53,11 +56,34 @@ uv run deepcontext ingest-confluence https://company.atlassian.net/wiki DOCS --l
 uv run deepcontext ingest-website https://ui.shadcn.com/docs --max-pages 50
 ```
 
-### 4. Search
+### 4. Search (CLI)
 
 ```bash
 uv run deepcontext search "middleware authentication"
 ```
+
+### 5. Run the HTTP API + MCP server (optional)
+
+You can also run DeepContext as a long-lived HTTP service that exposes:
+
+- **REST API** for ingestion, search, stats, and library metadata
+- **MCP server** mounted at `/mcp` for streamable-http MCP clients
+
+```bash
+# Start the API + MCP service (FastAPI + Uvicorn)
+uv run deepcontext serve --host 0.0.0.0 --port 8000
+
+# Open interactive docs
+#   http://localhost:8000/docs
+```
+
+For stdio-based MCP clients (e.g. local tools), you can also run:
+
+```bash
+uv run deepcontext-mcp
+```
+
+and configure your MCP client to talk to the `deepcontext-mcp` command.
 
 ## Example Output
 
@@ -209,19 +235,106 @@ Options:
 - `--host`: Qdrant host (default: localhost)
 - `--port`: Qdrant port (default: 6333)
 
+### Queue-based ingestion and job management
+
+DeepContext also supports **background ingestion** via a simple job queue. This is useful when you want to queue many large ingestions and process them with a worker.
+
+#### `deepcontext queue <source>`
+
+Queue a single source for ingestion (queued version of `deepcontext ingest`).
+
+Options mirror `deepcontext ingest`:
+
+- `--host`, `--port`, `--collection`
+- `--chunk-size`, `--threshold`, `--code-aware/--no-code-aware`
+
+The command prints a **job ID**; use `deepcontext jobs` / `deepcontext job` to inspect it.
+
+#### `deepcontext queue-repo <owner/repo>`
+
+Queue a GitHub repository for ingestion (queued version of `ingest-repo`).
+
+Options mirror `deepcontext ingest-repo`:
+
+- `--branch`, `--path`, `--extensions`, `--host`, `--port`, `--collection`
+
+#### `deepcontext queue-confluence <base_url> <space_key>`
+
+Queue a Confluence space for ingestion (queued version of `ingest-confluence`).
+
+Options mirror `deepcontext ingest-confluence`:
+
+- `--limit`, `--host`, `--port`, `--collection`
+
+#### `deepcontext queue-website <url>`
+
+Queue a website for ingestion (queued version of `ingest-website`).
+
+Options mirror `deepcontext ingest-website`:
+
+- `--max-pages`, `--pattern`, `--no-sitemap`, `--host`, `--port`, `--collection`
+
+#### `deepcontext jobs`
+
+List jobs in the queue with optional filters:
+
+- `--status`: `pending`, `processing`, `completed`, `failed`
+- `--limit`: maximum number of jobs to show (default: 20)
+
+#### `deepcontext job <job_id>`
+
+Show details for a specific job, including status, counts, timestamps and any error message.
+
+#### `deepcontext worker`
+
+Run a background worker that polls the queue and processes ingestion jobs:
+
+- `--once`: process a single job and exit
+- `--poll-interval`: seconds between polling for new jobs (default: 2.0)
+
+This is useful alongside the HTTP API, which also uses the same queue internally.
+
+#### `deepcontext cancel-job <job_id>`
+
+Cancel/delete a job from the queue. If the job is currently processing, it is removed from the queue but may still complete.
+
+#### `deepcontext clear-jobs`
+
+Clear all **completed** and **failed** jobs from the queue.
+
+#### `deepcontext serve`
+
+Start the HTTP API server (FastAPI + Uvicorn) with the MCP HTTP server mounted at `/mcp`:
+
+```bash
+uv run deepcontext serve --host 0.0.0.0 --port 8000
+```
+
+Options:
+
+- `--host`: Host to bind to (default: `0.0.0.0`)
+- `--port`: Port to bind to (default: `8000`)
+- `--reload`: Enable auto-reload for development
+
 ## Architecture
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  ContentFetcher │ ──▶ │ DocumentChunker │ ──▶ │   VectorStore   │
-│                 │     │                 │     │    (Qdrant)     │
-│ - Markdown      │     │ - Code-aware    │     │                 │
-│ - GitHub        │     │ - Section-based │     │ - FastEmbed     │
-│ - Webpages      │     │ - Smart titles  │     │ - Cosine sim    │
-│ - Websites      │     │                 │     │                 │
-│ - Confluence    │     │                 │     │                 │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-```
+┌─────────────────┐     ┌─────────────────┐     ┌────────────────────────────┐
+│  ContentFetcher │ ──▶ │ DocumentChunker │ ──▶ │   VectorStore (per-lib)    │
+│                 │     │ /SemanticChunker│     │    + LibraryStore (meta)   │
+│ - Markdown      │     │ - Code-aware    │     │                            │
+│ - GitHub        │     │ - Section-based │     │  Qdrant collections:       │
+│ - Webpages      │     │ - Smart titles  │     │  - one per library/site    │
+│ - Websites      │     │                 │     │  - one global `libraries`  │
+│ - Confluence    │     │                 │     │                            │
+└─────────────────┘     └─────────────────┘     └────────────────────────────┘
+
+                 ┌──────────────────────────────────────────────────────────┐
+                 │                   DeepContext Service                    │
+                 │  - HTTP API (/ingest, /search, /libraries, /stats, …)   │
+                 │  - Background worker processing queued jobs             │
+                 │  - MCP server (streamable-http) mounted at `/mcp`       │
+                 └──────────────────────────────────────────────────────────┘
 
 ## Python API
 
@@ -285,6 +398,9 @@ with ContentFetcher() as fetcher:
 | `GITHUB_TOKEN` | GitHub personal access token for higher API rate limits |
 | `CONFLUENCE_EMAIL` | Atlassian account email for Confluence access |
 | `CONFLUENCE_TOKEN` | Atlassian API token for Confluence access |
+| `QDRANT_HOST` | Host for the Qdrant instance used by the HTTP API / MCP server (default: `localhost`) |
+| `QDRANT_PORT` | Port for the Qdrant instance (default: `6333`) |
+| `DEFAULT_COLLECTION` | Default collection name for legacy CLI commands (default: `deepcontext_chunks`) |
 
 You can also use a `.env` file in the project root - it will be loaded automatically.
 

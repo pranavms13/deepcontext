@@ -10,8 +10,6 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from starlette.routing import Mount
-
 from deepcontext.models import IngestJob, JobStatus, JobType, SearchResult, SourceType
 from deepcontext.queue import generate_job_id, JobQueue, JobWorker
 from deepcontext.store import derive_library_id, library_id_to_collection_name, LibraryStore, VectorStore
@@ -228,11 +226,11 @@ app = FastAPI(
     description="Semantic chunking and search service for documents, repos, and webpages",
     version="0.1.0",
     lifespan=lifespan,
-    routes=[
-        # Mount MCP server at /mcp for streamable-http transport
-        Mount("/mcp", app=mcp_server.streamable_http_app()),
-    ],
 )
+
+# Mount MCP server for streamable-http transport
+# The streamable_http_app() already has routes at /mcp, so mount at root
+app.mount("/", app=mcp_server.streamable_http_app())
 
 # Add CORS middleware for browser-based MCP clients
 app.add_middleware(
